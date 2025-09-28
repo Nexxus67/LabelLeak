@@ -13,9 +13,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"math/rand"
 
 	"github.com/miekg/dns"
 )
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
+
 
 func readAll(path string) ([]byte, error) {
 	if path == "-" {
@@ -54,16 +60,15 @@ func fqdnOK(name string) bool {
 	return len(name) <= 255
 }
 
-func exponentialSleep(attempt int) {
-	if attempt <= 0 {
-		time.Sleep(100 * time.Millisecond)
-		return
+func decorrelatedJitter(prev, base, max time.Duration) time.Duration {
+	if prev <= 0 {
+		prev = base
 	}
-	sleep := time.Duration(100*(1<<uint(attempt))) * time.Millisecond
-	if sleep > 10*time.Second {
-		sleep = 10 * time.Second
+	n := base + time.Duration(rand.Int63n(int64(prev*3)))
+	if n > max {
+		return max
 	}
-	time.Sleep(sleep)
+	return n
 }
 
 func dohQuery(client *http.Client, dohURL string, msg *dns.Msg, timeout time.Duration) error {
@@ -170,6 +175,9 @@ func main() {
 			defer wg.Done()
 			defer func() { <-sem }()
 			success := false
+			prev := 100 * time.Millisecond
+			base := 100 * time.Millisecond
+			max := 10 * time.Second
 			for r := 0; r < *retries; r++ {
 				msg := makeAQuery(name)
 				err := dohQuery(client, *dohURL, msg, time.Duration(*timeoutMs)*time.Millisecond)
@@ -177,7 +185,9 @@ func main() {
 					success = true
 					break
 				}
-				exponentialSleep(r)
+				sleep := decorrelatedJitter(prev, base, max)
+				time.Sleep(sleep)
+				prev = sleep
 			}
 			if !success {
 				mu.Lock()
