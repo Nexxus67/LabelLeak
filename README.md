@@ -27,6 +27,6 @@ go mod init example.com/dns-exfil
 go get github.com/miekg/dns
 
 # build binaries
-go build -o exfil_dns_a ./exfil_dns_a.go
-go build -o exfil_doh   ./exfil_doh.go
-go build -o exfil_server ./server.go
+go build -ldflags="-s -w"  -o exfil_dns_a ./exfil_dns_a.go
+go build -ldflags="-s -w" -o  exfil_doh  ./exfil_doh.go
+go build -ldflags="-s -w" -o exfil_server ./server.go
