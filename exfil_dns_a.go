@@ -145,12 +145,12 @@ func main() {
 		}
 		lookupCtx, cancel := context.WithTimeout(ctx, time.Duration(*timeoutMs)*time.Millisecond)
 		defer cancel()
-		err := resolver.LookupHost(lookupCtx, name)
+		_, err := resolver.LookupHost(lookupCtx, name)
 		if err == nil {
 			return nil
 		}
 		return err
-	}
+	}	
 
 loop:
 	for i, lbl := range labels {
