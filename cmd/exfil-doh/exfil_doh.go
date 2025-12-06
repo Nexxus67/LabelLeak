@@ -8,12 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
-	"math/rand"
 
 	"github.com/miekg/dns"
 )
@@ -21,7 +21,6 @@ import (
 func init() {
 	rand.Seed(time.Now().UnixNano())
 }
-
 
 func readAll(path string) ([]byte, error) {
 	if path == "-" {
@@ -57,14 +56,15 @@ func clampLabel(sz int) int {
 }
 
 func fqdnOK(name string) bool {
-	return len(name) <= 255
+	return len(name)+1 <= 255
 }
 
 func decorrelatedJitter(prev, base, max time.Duration) time.Duration {
 	if prev <= 0 {
 		prev = base
 	}
-	n := base + time.Duration(rand.Int63n(int64(prev*3)))
+	limit := prev * 3
+	n := base + time.Duration(rand.Int63n(int64(limit)))
 	if n > max {
 		return max
 	}
@@ -78,20 +78,37 @@ func dohQuery(client *http.Client, dohURL string, msg *dns.Msg, timeout time.Dur
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, "POST", dohURL, bytes.NewReader(wire))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
 		return fmt.Errorf("doh status %d", resp.StatusCode)
 	}
-	_, _ = io.ReadAll(resp.Body)
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	var r dns.Msg
+	if err := r.Unpack(body); err != nil {
+		return err
+	}
+	if r.Rcode != dns.RcodeSuccess {
+		return fmt.Errorf("doh rcode %d", r.Rcode)
+	}
+
 	return nil
 }
 
