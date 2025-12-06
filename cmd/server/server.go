@@ -98,6 +98,7 @@ func (s *sessionStore) addChunk(session string, seq int, chunk string) error {
 		delete(s.bytes, session)
 		delete(s.expected, session)
 		delete(s.origFilename, session)
+		delete(s.lastSeen, session)
 		return fmt.Errorf("max bytes exceeded, session dropped")
 	}
 	return nil
