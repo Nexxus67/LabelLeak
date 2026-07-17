@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,6 +50,28 @@ func newStore() *sessionStore {
 	}
 }
 
+func safeName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '.' || r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
+}
+
+func inDomain(qName, domainFqdn string) bool {
+	return qName == domainFqdn || strings.HasSuffix(qName, "."+domainFqdn)
+}
+
 func (s *sessionStore) addChunk(session string, seq int, chunk string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -62,6 +85,9 @@ func (s *sessionStore) addChunk(session string, seq int, chunk string) error {
 		parts := strings.SplitN(chunk, "|", 3)
 		if len(parts) >= 2 && parts[0] == "meta" {
 			if total, err := strconv.Atoi(parts[1]); err == nil {
+				if total < 0 || total > *maxChunks {
+					return fmt.Errorf("invalid expected chunk count")
+				}
 				s.expected[session] = total
 			}
 			if len(parts) == 3 && parts[2] != "" {
@@ -112,11 +138,12 @@ func (s *sessionStore) shouldReconstruct(session string) bool {
 		return false
 	}
 	m := s.chunks[session]
-	got := len(m) - 1
-	if got < 0 {
-		got = 0
+	for i := 1; i <= exp; i++ {
+		if _, ok := m[i]; !ok {
+			return false
+		}
 	}
-	return got >= exp
+	return true
 }
 
 func (s *sessionStore) reconstructAndWrite(session string) (string, error) {
@@ -128,15 +155,13 @@ func (s *sessionStore) reconstructAndWrite(session string) (string, error) {
 	}
 	seqs := make([]int, 0, len(m))
 	for k := range m {
-		seqs = append(seqs, k)
+		if k != 0 {
+			seqs = append(seqs, k)
+		}
 	}
 	sort.Ints(seqs)
 	parts := make([]string, 0, len(seqs))
 	for _, i := range seqs {
-		// skip meta label 0 in the joined payload (we don't want the "meta|..." text in base32 stream)
-		if i == 0 {
-			continue
-		}
 		parts = append(parts, m[i])
 	}
 	origName := s.origFilename[session]
@@ -144,6 +169,7 @@ func (s *sessionStore) reconstructAndWrite(session string) (string, error) {
 	delete(s.bytes, session)
 	delete(s.expected, session)
 	delete(s.origFilename, session)
+	delete(s.lastSeen, session)
 	s.mu.Unlock()
 
 	joined := strings.Join(parts, "")
@@ -158,11 +184,16 @@ func (s *sessionStore) reconstructAndWrite(session string) (string, error) {
 		gr, err := gzip.NewReader(bytes.NewReader(data))
 		if err == nil {
 			var out bytes.Buffer
-			if _, err := io.Copy(&out, gr); err == nil {
+			_, copyErr := io.Copy(&out, io.LimitReader(gr, int64(*maxBytes)+1))
+			if copyErr == nil && out.Len() <= *maxBytes {
 				_ = gr.Close()
 				data = out.Bytes()
 			} else {
 				_ = gr.Close()
+				if copyErr != nil {
+					return "", copyErr
+				}
+				return "", fmt.Errorf("decompressed payload exceeds max bytes")
 			}
 		}
 	}
@@ -172,22 +203,9 @@ func (s *sessionStore) reconstructAndWrite(session string) (string, error) {
 	}
 	var name string
 	if origName != "" {
-		// sanitize session and origName minimally
-		var b strings.Builder
-		for _, r := range origName {
-			if (r >= 'a' && r <= 'z') ||
-				(r >= 'A' && r <= 'Z') ||
-				(r >= '0' && r <= '9') ||
-				r == '.' || r == '-' || r == '_' {
-				b.WriteRune(r)
-			} else {
-				b.WriteByte('_')
-			}
-		}
-		safeFn := b.String()
-		name = fmt.Sprintf("%s/%s_%s.bin", *outDir, session, safeFn)
+		name = filepath.Join(*outDir, fmt.Sprintf("%s_%s.bin", safeName(session), safeName(origName)))
 	} else {
-		name = fmt.Sprintf("%s/%s_%d.bin", *outDir, session, time.Now().Unix())
+		name = filepath.Join(*outDir, fmt.Sprintf("%s_%d.bin", safeName(session), time.Now().Unix()))
 	}
 	if err := os.WriteFile(name, data, 0o644); err != nil {
 		return "", err
@@ -201,6 +219,7 @@ func (s *sessionStore) cleanup(session string) {
 	delete(s.bytes, session)
 	delete(s.expected, session)
 	delete(s.origFilename, session)
+	delete(s.lastSeen, session)
 	s.mu.Unlock()
 }
 
@@ -220,7 +239,7 @@ func serveDNS(s *sessionStore, targetDomain string) {
 
 		q := r.Question[0]
 		qName := q.Name
-		if !strings.HasSuffix(qName, domainFqdn) && qName != domainFqdn {
+		if !inDomain(qName, domainFqdn) {
 			m.Rcode = dns.RcodeNameError
 			_ = w.WriteMsg(m)
 			return
@@ -229,19 +248,16 @@ func serveDNS(s *sessionStore, targetDomain string) {
 		name := strings.TrimSuffix(qName, ".")
 		parts := strings.Split(name, ".")
 		domainParts := strings.Split(strings.TrimSuffix(domainFqdn, "."), ".")
-		if len(parts) < 3+len(domainParts) {
-			m.Rcode = dns.RcodeSuccess
-			_ = w.WriteMsg(m)
-			return
-		}
-
-		sessionIndex := len(parts) - len(domainParts) - 1
-		session := parts[sessionIndex]
 		seqStr := parts[0]
-		chunk := parts[1]
 
 		// handle done/cleanup forms like done.<session>.<domain>
 		if strings.HasPrefix(seqStr, "done") || strings.HasPrefix(seqStr, "cleanup") {
+			if len(parts) != 2+len(domainParts) {
+				m.Rcode = dns.RcodeFormatError
+				_ = w.WriteMsg(m)
+				return
+			}
+			session := parts[1]
 			if strings.HasPrefix(seqStr, "done") {
 				// try reconstruct (force) even if expected not set or not all arrived
 				path, err := s.reconstructAndWrite(session)
@@ -260,6 +276,16 @@ func serveDNS(s *sessionStore, targetDomain string) {
 			_ = w.WriteMsg(m)
 			return
 		}
+
+		if len(parts) < 3+len(domainParts) {
+			m.Rcode = dns.RcodeSuccess
+			_ = w.WriteMsg(m)
+			return
+		}
+
+		sessionIndex := len(parts) - len(domainParts) - 1
+		session := parts[sessionIndex]
+		chunk := parts[1]
 
 		seq, err := strconv.Atoi(seqStr)
 		if err != nil {
